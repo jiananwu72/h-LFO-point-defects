@@ -1,0 +1,14 @@
+name: emenv
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - abtem=1.0.6
+  - atomap=0.4.2
+  - exspy=0.3.2
+  - ipykernel=7.0.0
+  - numpy=1.26.4
+  - scipy=1.16.3
+  - scikit-image=0.25.2
+  - cupy
+  - cuda-version=12

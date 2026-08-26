@@ -22,7 +22,7 @@ NUM_GPUS=4
 RUN_NAME="half_reversed_fp"
 
 PRISTINE_FILE="data/structures/pristine.vasp"
-REVERSED_FILE="data/structures/pristine_phase_reversed.vasp"
+REVERSED_FILE="data/structures/pristine_reversed.vasp"
 X_REPEAT=1
 Y_REPEAT=1
 PRISTINE_LAYERS=12
@@ -72,8 +72,8 @@ for ((GPU_ID=0; GPU_ID<NUM_GPUS; GPU_ID++)); do
         --frozen-phonon-seed "$SEED" \
         --frozen-phonon-sigma 0.07 \
         --potential-sampling 0.05 \
-        --scan-start "0.25,0.2" \
-        --scan-end "0.75,0.8" \
+        --scan-start "0.083333,0" \
+        --scan-end "0.916667,1" \
         --detector-inner 80 \
         --detector-outer 200 \
         --interpolation-sampling 0.05 \

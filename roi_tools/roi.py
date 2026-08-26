@@ -195,35 +195,6 @@ def equalize_patch_sizes(grid, signal=None):
     return grid
 
 
-def subtract_background(grid, threshold=0.02):
-    """Subtract local patch background and return the per-patch backgrounds."""
-    if threshold <= 0 or threshold > 1:
-        raise ValueError("threshold must be in the interval (0, 1].")
-
-    n_cols, n_rows = grid.shape
-    backgrounds = np.empty(grid.shape, dtype=float)
-
-    for (i, j), patch in np.ndenumerate(grid.patches):
-        neighbor_pixels = []
-
-        for di in [-1, 0, 1]:
-            for dj in [-1, 0, 1]:
-                ni, nj = i + di, j + dj
-                if 0 <= ni < n_cols and 0 <= nj < n_rows:
-                    neighbor_pixels.append(grid[ni, nj].data.ravel())
-
-        pixels = np.concatenate(neighbor_pixels)
-        n_bg = max(1, int(len(pixels) * threshold))
-        backgrounds[i, j] = float(np.mean(np.sort(pixels)[:n_bg]))
-        if hasattr(patch, "background"):
-            del patch.background
-
-    for index, patch in np.ndenumerate(grid.patches):
-        patch.image = patch.image - backgrounds[index]
-
-    return backgrounds
-
-
 class IntensityAnalyzer:
     """Compute patch intensity arrays and vicinity metrics."""
 
@@ -290,12 +261,28 @@ class PositionAnalyzer:
     def __init__(self, maxfev=1000):
         self.maxfev = maxfev
 
-    def fit(self, grid):
-        """Fit all patches and return fitted image positions."""
+    def fit(self, grid, method="circular", return_parameters=False):
+        """Fit all patches, optionally returning per-patch parameters."""
+        self._validate_method(method)
         positions = np.full(grid.shape + (2,), np.nan, dtype=float)
+        parameters = (
+            self._empty_parameter_arrays(grid.shape, method)
+            if return_parameters
+            else None
+        )
 
         for index, patch in np.ndenumerate(grid.patches):
-            fit_result = self.fit_patch(patch)
+            fit_result = self.fit_patch(
+                patch,
+                method=method,
+                return_parameters=return_parameters,
+            )
+
+            if return_parameters:
+                fit_result, patch_parameters = fit_result
+                for name, value in patch_parameters.items():
+                    parameters[name][index] = value
+
             if fit_result is None:
                 continue
 
@@ -305,17 +292,72 @@ class PositionAnalyzer:
 
             positions[index] = np.array([image_x, image_y], dtype=float)
 
+        if return_parameters:
+            return positions, parameters
         return positions
 
-    def fit_patch(self, patch):
-        """Fit one patch and return image-local x and y."""
+    def get_Lu_phases(self, grid, method="circular"):
+        """Return Lu phase distances and nearest-state classifications."""
+        positions = self.fit(grid, method=method)
+        lu_mask = grid.atom_type_mask("Lu")
+        singlet_distances = np.full(grid.shape, np.nan)
+        doublet_distances = np.full(grid.shape, np.nan)
+        class_map = np.full(grid.shape, np.nan)
+
+        theta = np.array([0, 2 * np.pi / 3, 4 * np.pi / 3])
+        singlet_phases = np.mod(theta[1] + np.array([0, np.pi]), 2 * np.pi)
+        doublet_phases = np.mod(
+            np.concatenate((theta[[0, 2]], theta[[0, 2]] + np.pi)),
+            2 * np.pi,
+        )
+
+        for column in range(1, grid.shape[0] - 1):
+            for row in range(grid.shape[1]):
+                if not np.all(lu_mask[column - 1 : column + 2, row]):
+                    continue
+
+                z = positions[column - 1 : column + 2, row, 1]
+                if not np.all(np.isfinite(z)):
+                    continue
+
+                u = z - np.mean(z)
+                a = 2 / 3 * np.sum(u * np.cos(theta))
+                b = 2 / 3 * np.sum(u * np.sin(theta))
+                phi = np.mod(np.arctan2(b, a), 2 * np.pi)
+
+                singlet_distances[column, row] = np.min(
+                    np.abs(np.angle(np.exp(1j * (phi - singlet_phases))))
+                )
+                doublet_distances[column, row] = np.min(
+                    np.abs(np.angle(np.exp(1j * (phi - doublet_phases))))
+                )
+
+                singlet_distance = singlet_distances[column, row]
+                doublet_distance = doublet_distances[column, row]
+                if np.isclose(singlet_distance, doublet_distance):
+                    continue
+                if singlet_distance < doublet_distance:
+                    class_map[column, row] = 1
+                else:
+                    class_map[column, row] = -1
+
+        return singlet_distances, doublet_distances, class_map
+
+    def fit_patch(self, patch, method="circular", return_parameters=False):
+        """Fit one patch, optionally returning its fitted parameters."""
+        self._validate_method(method)
+        failed_result = (
+            ((np.nan, np.nan), self._empty_patch_parameters(method))
+            if return_parameters
+            else None
+        )
         data = np.asarray(patch.data, dtype=float)
         if data.ndim != 2 or not np.isfinite(data).all():
-            return None
+            return failed_result
 
         height, width = data.shape
         if height == 0 or width == 0:
-            return None
+            return failed_result
 
         center_y, center_x = height // 2, width // 2
         y_grid, x_grid = np.mgrid[-center_y : height - center_y, -center_x : width - center_x]
@@ -323,36 +365,153 @@ class PositionAnalyzer:
         bg = float(np.min(data))
         amp_guess = float(np.max(data) - bg)
         if amp_guess <= 0:
-            return None
+            return failed_result
 
         cy_guess, cx_guess = center_of_mass(data - bg)
         if not np.isfinite(cx_guess) or not np.isfinite(cy_guess):
-            return None
+            return failed_result
 
-        p0 = [amp_guess, cx_guess - center_x, cy_guess - center_y, 2.0, bg]
+        if method == "circular":
+            model = self._gaussian_2d
+            p0 = [amp_guess, cx_guess - center_x, cy_guess - center_y, 2.0, bg]
+        else:
+            model = self._elliptical_gaussian_2d
+            p0 = [amp_guess, cx_guess - center_x, cy_guess - center_y, 2.0, 2.0, 0.0, bg]
 
         try:
             popt, _ = curve_fit(
-                self._gaussian_2d,
+                model,
                 (x_grid, y_grid),
                 data.ravel(),
                 p0=p0,
                 maxfev=self.maxfev,
             )
         except (RuntimeError, ValueError, FloatingPointError):
-            return None
+            return failed_result
 
-        _, dx, dy, _, _ = popt
+        if not np.isfinite(popt).all():
+            return failed_result
+
+        dx, dy = popt[1:3]
         x_fit = center_x + dx
         y_fit = center_y + dy
 
         if not (0 <= x_fit < width and 0 <= y_fit < height):
-            return None
+            return failed_result
 
-        return float(x_fit), float(y_fit)
+        local_center = np.array([x_fit, y_fit], dtype=float)
+        if not return_parameters:
+            return float(x_fit), float(y_fit)
+
+        global_center = local_center + np.array(
+            [patch.col_edges[0], patch.row_edges[0]],
+            dtype=float,
+        )
+        parameters = self._empty_patch_parameters(method)
+        parameters.update(
+            amplitude=float(popt[0]),
+            local_center=local_center,
+            global_center=global_center,
+            theta=0.0 if method == "circular" else float(popt[5]),
+            offset=float(popt[-1]),
+            fit_success=True,
+        )
+        if method == "circular":
+            parameters["sigma"] = abs(float(popt[3]))
+        else:
+            parameters["sigma_x"] = abs(float(popt[3]))
+            parameters["sigma_y"] = abs(float(popt[4]))
+
+        return (float(x_fit), float(y_fit)), parameters
+
+    @staticmethod
+    def _empty_patch_parameters(method):
+        parameters = {
+            "amplitude": np.nan,
+            "local_center": np.full(2, np.nan),
+            "global_center": np.full(2, np.nan),
+            "theta": np.nan,
+            "offset": np.nan,
+            "fit_success": False,
+        }
+        if method == "circular":
+            parameters["sigma"] = np.nan
+        else:
+            parameters["sigma_x"] = np.nan
+            parameters["sigma_y"] = np.nan
+        return parameters
+
+    @staticmethod
+    def _empty_parameter_arrays(shape, method):
+        parameters = {
+            "amplitude": np.full(shape, np.nan),
+            "local_center": np.full(shape + (2,), np.nan),
+            "global_center": np.full(shape + (2,), np.nan),
+            "theta": np.full(shape, np.nan),
+            "offset": np.full(shape, np.nan),
+            "fit_success": np.zeros(shape, dtype=bool),
+        }
+        if method == "circular":
+            parameters["sigma"] = np.full(shape, np.nan)
+        else:
+            parameters["sigma_x"] = np.full(shape, np.nan)
+            parameters["sigma_y"] = np.full(shape, np.nan)
+        return parameters
 
     @staticmethod
     def _gaussian_2d(coords, amplitude, xo, yo, sigma, offset):
         x, y = coords
         g = offset + amplitude * np.exp(-((x - xo) ** 2 + (y - yo) ** 2) / (2 * sigma**2))
         return g.ravel()
+
+    @staticmethod
+    def _elliptical_gaussian_2d(
+        coords,
+        amplitude,
+        xo,
+        yo,
+        sigma_x,
+        sigma_y,
+        theta,
+        offset,
+    ):
+        x, y = coords
+        cos_theta = np.cos(theta)
+        sin_theta = np.sin(theta)
+        x_rotated = cos_theta * (x - xo) + sin_theta * (y - yo)
+        y_rotated = -sin_theta * (x - xo) + cos_theta * (y - yo)
+        g = offset + amplitude * np.exp(
+            -0.5
+            * (
+                (x_rotated / sigma_x) ** 2
+                + (y_rotated / sigma_y) ** 2
+            )
+        )
+        return g.ravel()
+
+    @staticmethod
+    def _validate_method(method):
+        if method not in {"circular", "elliptical"}:
+            raise ValueError("method must be 'circular' or 'elliptical'.")
+
+
+def subtract_background(grid):
+    """Subtract fitted constant offsets and return them per patch."""
+    _, parameters = PositionAnalyzer().fit(
+        grid,
+        method="circular",
+        return_parameters=True,
+    )
+    backgrounds = parameters["offset"]
+    failed = ~parameters["fit_success"]
+    if np.any(failed):
+        raise RuntimeError(
+            f"Background fitting failed for {np.count_nonzero(failed)} patches."
+        )
+
+    for index, patch in np.ndenumerate(grid.patches):
+        if hasattr(patch, "background"):
+            del patch.background
+        patch.image = patch.image - backgrounds[index]
+
+    return backgrounds

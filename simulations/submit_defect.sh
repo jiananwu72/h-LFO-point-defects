@@ -22,7 +22,7 @@ NUM_ENSEMBLES=100
 NUM_GPUS=4
 NUM_ARRAY_TASKS=4
 # Change this to the defect you want to simulate
-DEFECT="LuFe_down"
+DEFECT="LuFe_singlet"
 
 PRISTINE_FILE="data/structures/pristine.vasp"
 DEFECT_FILE="data/structures/${DEFECT}.vasp"
